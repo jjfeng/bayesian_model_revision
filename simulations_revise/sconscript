@@ -1,0 +1,220 @@
+"""
+Simulations for linear model revisions
+"""
+
+import os
+
+from os.path import join
+from nestly.scons import SConsWrap
+from nestly import Nest
+from SCons.Script import Environment, Command, AddOption
+
+Import('env')
+localenv = env.Clone()
+
+# Set up state
+nest = SConsWrap(Nest(), localenv['output'], alias_environment=localenv)
+
+INIT_TRAIN = 300
+NUM_CHANGE = 6
+TEST_BATCH = 10
+HIST_BATCH = 50
+
+NUM_SEEDS = localenv['num_seeds']
+
+nest.add(
+    'num_p',
+    [10],
+    label_func=lambda c: "num_p_%d" % c)
+
+nest.add(
+    'simulation',
+    [
+	'iid_big_deteriorate',
+    	'cyclical_deteriorate',
+    	'very_deteriorate',
+    ])
+
+nest.add(
+    'init_beta',
+    [0.35],
+    label_func=lambda c: "beta_%.2f" % c)
+
+nest.add(
+    'recalib',
+    [200],
+    label_func=lambda c: "recalib_%d" % c)
+
+nest.add_aggregate("summary_res", list)
+nest.add(
+    'seed',
+    range(NUM_SEEDS),
+    label_func=lambda c: "seed_%d" % c)
+
+@nest.add_target_with_env(localenv)
+def generate_data(env, outdir, c):
+    cmd = [
+        'python generate_data_single_pop.py',
+        '--meta-seed 1',
+        '--data-seed',
+        100 + c['seed'],
+        '--sparse',
+        c['num_p'],
+        '--change',
+        NUM_CHANGE,
+        '--p',
+        c['num_p'],
+        '--init-sparse-beta',
+        c['init_beta'],
+        '--init-perturb 0.15',
+        '--test-n 4000',
+        '--init-train-n',
+        INIT_TRAIN,
+        '--init-recalib-n',
+        c['recalib'],
+        '--simulation',
+	c['simulation'],
+	'--out ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'data.pkl'),
+            join(outdir, 'log.txt')],
+        [],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    'model_sim',
+    [
+    	'fixed',
+    ])
+
+@nest.add_target_with_env(localenv)
+def create_modeler(env, outdir, c):
+    cmd = [
+        'python create_modeler.py',
+        '--seed',
+	c['seed'],
+        '--max-depth 2',
+        '--n-estimators 1000',
+        '--simulation',
+        c['model_sim'],
+	'--data ${SOURCES[0]}',
+	'--out ${TARGETS[0]}'
+    ]
+    return env.Command(
+        [
+            join(outdir, 'models.pkl')],
+        c["generate_data"],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    'type_i_regret',
+    [
+        0.1,
+    ],
+    label_func=lambda c: "regret_%.2f" % c)
+
+nest.add(
+    'inflation',
+    [
+        0.003,
+    ],
+    label_func=lambda c: "inflat_%.4f" % c)
+
+@nest.add_target_with_env(localenv)
+def do_online_recalib(env, outdir, c):
+    cmd = [
+        'python main.py',
+	"--reference-recalib",
+	"locked,adam,cumulativeLR",
+        '--seed',
+	c['seed'],
+        '--type-i-regret',
+        c['type_i_regret'],
+        '--embedding-idxs',
+        ",".join(list(map(str, range(c['num_p'])))),
+        '--alphas 0.01',
+        '--hist-batch',
+        HIST_BATCH,
+        '--test-batch',
+        TEST_BATCH,
+	'--max-covariance-scale 1.5',
+	'--inflation',
+	"0,%.4f" % c['inflation'],
+	'--data ${SOURCES[0]}',
+	'--model ${SOURCES[1]}',
+	'--scores-file ${TARGETS[0]}',
+	'--obs-scores-file ${TARGETS[1]}',
+	'--recalibrators-file ${TARGETS[2]}',
+	'--history ${TARGETS[4]}',
+	'--log ${TARGETS[3]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'eci.csv'),
+            join(outdir, 'obs_hist.csv'),
+            join(outdir, 'recalibrators.pkl'),
+            join(outdir, 'log.txt'),
+            join(outdir, 'history.csv'),
+        ],
+        c["generate_data"][:1] + c["create_modeler"],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def plot_eci(env, outdir, c):
+    cmd = [
+        'python plot_calibration_scores.py',
+	'--plot-measures auc,eci',
+	'--scores ${SOURCES[0]}',
+	'--obs-scores ${SOURCES[1]}',
+	'--recalibrators ${SOURCES[2]}',
+	'--out-fig ${TARGETS[0]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'eci.png')],
+        c["do_online_recalib"],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def summarize_scores(env, outdir, c):
+    cmd = [
+        'python summarize_scores.py',
+	'--scores ${SOURCES[0]}',
+	'--recalibrator ${SOURCES[2]}',
+	'--out-csv ${TARGETS[0]}',
+    ]
+    targets = [join(outdir, 'avg_res.csv')]
+    c['summary_res'].append(targets[0])
+    return env.Command(
+        targets,
+        c["do_online_recalib"],
+        ' '.join(map(str, cmd)))
+nest.pop("seed")
+
+@nest.add_target_with_env(localenv)
+def summarize(env, outdir, c):
+    cmd = [
+        'python summarize.py',
+	'--id-cols',
+	'mdl,pop_idx,measure',
+	'--pivot-cols',
+	'measure,pop_idx',
+	'--pivot-rows',
+	'mdl',
+	'--measure-filter',
+	'eci,nll,auc',
+	'--pop-idx-filter',
+	'All',
+	'--results',
+        ",".join(["simulations_revise/%s" % r for r in c['summary_res']]),
+	'--out-csv ${TARGETS[0]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'res_summary.csv'),
+        ],
+        c["summary_res"],
+        ' '.join(map(str, cmd)))

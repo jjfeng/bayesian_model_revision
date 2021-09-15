@@ -1,0 +1,256 @@
+import os
+
+from os.path import join
+from nestly.scons import SConsWrap
+from nestly import Nest
+from SCons.Script import Environment, Command, AddOption
+
+Import('env')
+localenv = env.Clone()
+
+# Set up state
+nest = SConsWrap(Nest(), localenv['output'], alias_environment=localenv)
+
+NUM_SEEDS = localenv['num_seeds']
+INIT_TRAIN = 300
+NUM_P = 10
+TEST_BATCH = 10
+HIST_BATCH = 50
+
+nest.add('proportions',
+    [
+        20,
+    ],
+    label_func=lambda c: "prop_%d" % c)
+
+nest.add(
+    'simulation',
+    [
+	'iid_deteriorate+iid_deteriorate',
+	'late_deteriorate+mid_deteriorate',
+    ])
+
+nest.add(
+    'recalib',
+    [
+        100,
+    ],
+    label_func=lambda c: "recalib_%d" % c)
+
+nest.add(
+    'subpop_aware',
+    lambda c: [False,True] if c['simulation'] == 'late_deteriorate+mid_deteriorate' else [True],
+    label_func=lambda c: "subpop_aware_%d" % c)
+
+nest.add_aggregate("summary_res", list)
+nest.add(
+    'seed',
+    range(NUM_SEEDS),
+    label_func=lambda c: "seed_%d" % c)
+
+@nest.add_target_with_env(localenv)
+def generate_data(env, outdir, c):
+    cmd = [
+        'python generate_data_two_pop.py',
+        '--meta-seed 0',
+        '--data-seed',
+	102 + c['seed'],
+        '--subpopulations',
+        "%d,%d" % (c["proportions"], 100-c["proportions"]),
+        '--change-p',
+        8,
+        '--sparse',
+        NUM_P,
+        '--p',
+        NUM_P,
+        '--beta1',
+        0.6,
+        '--beta2',
+        0.4,
+        '--init-perturb',
+        "0.27,0.2" if "iid" in c["simulation"] else "0.04,0.04",
+        '--init-train-n',
+        INIT_TRAIN,
+        '--init-recalib-n',
+        c['recalib'],
+        '--test-n 4000',
+        '--simulation',
+	c['simulation'].replace("+",","),
+	'--out ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'data.pkl'),
+            join(outdir, 'log.txt')],
+        [],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    'model_sim',
+    [
+    	'fixed',
+    ])
+
+@nest.add_target_with_env(localenv)
+def create_modeler(env, outdir, c):
+    cmd = [
+        'python create_modeler.py',
+        '--seed',
+	c['seed'],
+        '--max-depth 2',
+        '--n-estimators 6000',
+        '--simulation',
+        c['model_sim'],
+	'--data ${SOURCES[0]}',
+	'--out ${TARGETS[0]}'
+    ]
+    return env.Command(
+        [
+            join(outdir, 'models.pkl')],
+        c["generate_data"],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    'type_i_regret',
+    [0.05],
+    label_func=lambda c: "regret_%.2f" % c)
+
+nest.add(
+    'inflation',
+    [
+         0.003
+    ],
+    label_func=lambda c: "inflat_%.4f" % c)
+
+@nest.add_target_with_env(localenv)
+def do_online_recalib(env, outdir, c):
+    cmd = [
+        'python main.py',
+        '--seed',
+	c['seed'],
+        '--embedding-idxs 0' if c['subpop_aware'] else '',
+        '--is-subgroup-embedding' if c['subpop_aware'] else '',
+        '--type-i-regret',
+        c['type_i_regret'],
+        '--alphas 0.01',
+        '--obs-batch 1',
+        '--hist-batch',
+        HIST_BATCH,
+        '--test-batch',
+        TEST_BATCH,
+	'--max-covariance-scale 1.5',
+	'--inflation',
+	"0,%.4f" % c['inflation'],
+        '--reference-recalibs',
+        "locked,adam,cumulativeLR",
+	'--data ${SOURCES[0]}',
+	'--model ${SOURCES[1]}',
+	'--scores-file ${TARGETS[0]}',
+	'--obs-scores-file ${TARGETS[1]}',
+	'--recalibrators-file ${TARGETS[2]}',
+	'--history-file ${TARGETS[3]}',
+	'--log ${TARGETS[4]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'eci.csv'),
+            join(outdir, 'obs_hist.csv'),
+            join(outdir, 'recalibrators.pkl'),
+            join(outdir, 'history.csv'),
+            join(outdir, 'log.txt')],
+        c["generate_data"][:1] + c["create_modeler"],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def plot_eci(env, outdir, c):
+    cmd = [
+        'python plot_calibration_scores.py',
+        '--subpops 0,1' if c['subpop_aware'] else '',
+        '--plot-measures eci',
+	'--scores ${SOURCES[0]}',
+	'--obs-scores ${SOURCES[1]}',
+	'--recalibrators ${SOURCES[2]}',
+	'--out-fig ${TARGETS[0]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'eci.png'),
+        ],
+        c["do_online_recalib"],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def summarize_scores(env, outdir, c):
+    cmd = [
+        'python summarize_scores.py',
+	'--scores ${SOURCES[0]}',
+	'--recalibrator ${SOURCES[2]}',
+	'--out-csv ${TARGETS[0]}',
+    ]
+    targets = [join(outdir, 'avg_res.csv')]
+    c['summary_res'].append(targets[0])
+    return env.Command(
+        targets,
+        c["do_online_recalib"],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def plot_calibration_curves_combine(env, outdir, c):
+    SAMPLING_FACTOR = 0.006
+    if c['seed'] % 10 == 0:
+        # plot for subset of seeds
+        cmd = [
+            'python plot_calibration_curves_combine.py',
+            '--subpop-weights %f,%f' % (c['proportions']  * SAMPLING_FACTOR, (100 - c['proportions']) * SAMPLING_FACTOR),
+            '--history ${SOURCES[3]}',
+            '--out-errors-fig ${TARGETS[0]}',
+        ]
+        return env.Command(
+            [
+                join(outdir, 'curves_err_combine.png')],
+            c["do_online_recalib"],
+            ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def plot_calibration_curves(env, outdir, c):
+    if c['seed']  % 10 == 0:
+        # plot for subset of seeds
+        cmd = [
+            'python plot_calibration_curves.py',
+            '--sample-rate 0.5',
+            '--history ${SOURCES[3]}',
+            '--out-errors-fig ${TARGETS[0]}',
+        ]
+        return env.Command(
+            [
+                join(outdir, 'curves_err.png')],
+            c["do_online_recalib"],
+            ' '.join(map(str, cmd)))
+
+nest.pop("seed")
+
+@nest.add_target_with_env(localenv)
+def summarize(env, outdir, c):
+    cmd = [
+        'python summarize.py',
+	'--id-cols',
+	'mdl,pop_idx,measure',
+	'--pivot-cols',
+	'measure,pop_idx',
+	'--pivot-rows',
+	'mdl',
+	'--measure-filter',
+	'nll,eci',
+	'--pop-idx-filter',
+	'0,1,All',
+	'--results',
+        ",".join(["simulations_recalib/%s" % r for r in c['summary_res']]),
+	'--out-csv ${TARGETS[0]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'res_summary.csv'),
+        ],
+        c["summary_res"],
+        ' '.join(map(str, cmd)))

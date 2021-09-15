@@ -1,0 +1,194 @@
+import os
+
+from os.path import join
+from nestly.scons import SConsWrap
+from nestly import Nest
+from SCons.Script import Environment, Command, AddOption
+
+Import('env')
+localenv = env.Clone()
+
+COPD_DAT_PATH = {
+    "order_date_cts": "data/online_recalib_cts_copd_dat.csv"}
+NUM_BATCHES = 400
+NTRAIN = 2400
+NRECALIB = 1000
+MAX_OBS = 108000
+EMBEDDING_DICT = {
+    1: "0,3,4",
+}
+
+# Set up state
+nest = SConsWrap(Nest(), localenv['output'], alias_environment=localenv)
+
+nest.add(
+    'data',
+    [
+        "order_date_cts",
+    ])
+
+nest.add(
+    'num_p',
+    [
+	 36,
+    ],
+    label_func=lambda c: "nump_%d" % c)
+
+nest.add(
+    'num_obs',
+    [
+        108000,
+    ],
+    label_func=lambda c: "size_%d" % c)
+
+@nest.add_target_with_env(localenv)
+def load_data(env, outdir, c):
+    cmd = [
+        'python load_data.py',
+        '--num-p',
+        c['num_p'],
+        '--sample-rate 1',
+        '--init-train-n',
+        NTRAIN,
+        '--init-recalib-n',
+        NRECALIB, # choose large enough for standard errors not to be huge
+        '--obs-n',
+        c['num_obs'] - NTRAIN - NRECALIB,
+        '--data-file',
+	COPD_DAT_PATH[c['data']],
+	'--out ${TARGETS[0]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'data.pkl')],
+        [],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    'seed',
+    range(1),
+    label_func=lambda c: "seed_%d" % c)
+
+nest.add(
+    'model_sim',
+    [
+    	'fixed',
+    	'combo_boxed',
+    	'boxed',
+    ])
+
+@nest.add_target_with_env(localenv)
+def create_modeler(env, outdir, c):
+    cmd = [
+        'python create_modeler.py',
+        '--seed',
+	c['seed'],
+        '--refit-freq',
+        int(min(c['num_obs'], MAX_OBS)/NUM_BATCHES),
+        '--max-box',
+        MAX_OBS,
+        '--simulation',
+        c['model_sim'],
+	'--data ${SOURCES[0]}',
+	'--out ${TARGETS[0]}'
+    ]
+    return env.Command(
+        [
+            join(outdir, 'models.pkl')],
+        c["load_data"],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    'batch_size',
+    [
+        10,
+    ],
+    label_func=lambda c: "batch_%d" % c)
+
+nest.add(
+    'regret',
+    [0.05],
+    label_func=lambda c: "regret_%.2f" % c)
+nest.add(
+    'inflation',
+    lambda c: ["0,%.3f" % (0.0005 * c['batch_size']) if c['model_sim'] != 'boxed' else None],
+    label_func=lambda c: "inflat_%s" % c)
+nest.add(
+    'linear_update',
+    lambda c: [0, 1] if c['model_sim'] == 'fixed' else [0],
+    label_func=lambda c: "linear_update_%d" % c)
+
+@nest.add_target_with_env(localenv)
+def do_online_recalib(env, outdir, c):
+    cmd = [
+        'python main.py',
+        '--reference-recalibs',
+        "locked,adam,cumulativeLR" if c['model_sim'] != 'boxed' else 'locked',
+        '--obs-batch',
+        c['batch_size'],
+        '--embedding-idxs %s' % EMBEDDING_DICT[c['linear_update']] if c['linear_update'] else "",
+        '--seed',
+	c['seed'],
+        '--test-batch',
+        int(min(c['num_obs'], MAX_OBS)/NUM_BATCHES),
+        '--type-i-regret',
+        c['regret'],
+        '--max-covariance-scale 1.5',
+        '--alphas',
+        0.0005 * c['batch_size'],
+	'--inflation %s' % c['inflation'] if c['inflation'] is not None else '',
+	'--data ${SOURCES[0]}',
+	'--model ${SOURCES[1]}',
+	'--obs-scores-file ${TARGETS[0]}',
+	'--recalibrators-file ${TARGETS[1]}',
+	'--log ${TARGETS[2]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'obs_hist.csv'),
+            join(outdir, 'recalibrators.pkl'),
+            join(outdir, 'log.txt')],
+        c["load_data"] + c["create_modeler"],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def plot_curves(env, outdir, c):
+    cmd = [
+        'python plot_calibration_obs_curves.py',
+        '--num-batch 4',
+	'--history ${SOURCES[0]}',
+	'--out-nll ${TARGETS[0]}',
+	'--out-roc ${TARGETS[1]}',
+	'--out-errors ${TARGETS[2]}',
+	'--out-csv ${TARGETS[3]}',
+	'--log ${TARGETS[4]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'curves_nll.png'),
+            join(outdir, 'curves_roc.png'),
+            join(outdir, 'curves_err.png'),
+            join(outdir, 'calib_err.csv'),
+            join(outdir, 'res_log.txt'),
+        ],
+        c["do_online_recalib"],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def plot_thetas(env, outdir, c):
+    cmd = [
+        'python plot_thetas.py',
+        '--show-legend',
+        '--do-rotate',
+        '--is-evolving' if c['model_sim'] == 'combo_boxed' else '',
+        '--var-labels "Age,Hx COPD,Hx Smoking"' if c['linear_update'] else '',
+        '--plot-recalibs BLR,marBLR',
+	'--recalibrators ${SOURCES[1]}',
+	'--out-fig-time ${TARGETS[0]}',
+    ]
+    return env.Command(
+        [
+            join(outdir, 'thetas_time.png'),
+        ],
+        c["do_online_recalib"],
+        ' '.join(map(str, cmd)))

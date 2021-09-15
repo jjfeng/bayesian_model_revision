@@ -89,6 +89,7 @@ def parse_args():
     parser.add_argument(
         '--embedding-idxs',
         type=str,
+        default="",
         help="comma-separated list of other variable indices to pass to the recalibrator")
     parser.add_argument(
         '--is-subgroup-embedding',

@@ -26,7 +26,7 @@ def parse_args():
         '--simulation',
         type=str,
         default="fixed",
-        choices=["fixed", "cumulative_refit", "combo_refit", "combo_boxed", "boxed", "refit"])
+        choices=["fixed", "cumulative_refit", "combo_refit", "combo_boxed", "boxed"])
     parser.add_argument(
         '--n-estimators',
         type=int,
@@ -72,9 +72,6 @@ def main():
         clf = LockedModeler(data.get_train_dat(), max_depth=args.max_depth, n_estimators=args.n_estimators)
     elif args.simulation == "cumulative_refit":
         clf = CumulativeModeler(data.get_train_dat(), max_depth=args.max_depth, refit_freq=args.refit_freq, n_estimators=args.n_estimators)
-    elif args.simulation == "refit":
-        train_dat = data.get_train_dat()
-        clf = CumulativeModeler(train_dat, max_depth=args.max_depth, refit_freq=args.refit_freq, n_estimators=args.n_estimators)
     elif args.simulation == "boxed":
         train_dat = data.get_train_dat()
         clf = BoxedModeler(train_dat, max_depth=args.max_depth, refit_freq=args.refit_freq, max_trains=args.max_box, n_estimators=args.n_estimators, switch_time=args.switch_time)
